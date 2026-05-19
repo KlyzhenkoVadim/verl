@@ -125,6 +125,10 @@ ENV/
 # data
 *.parquet
 
+#spec-rl
+eval
+.triton
+tensorboard_log
 
 # local logs
 logs
