@@ -18,17 +18,16 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import glob
 import json
 import os
+import re
 import uuid
 from collections import defaultdict
-from copy import deepcopy
-from dataclasses import dataclass, field
-from enum import Enum
-from pprint import pprint
-from typing import Any, Optional, List, Dict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import glob, re, os
+from pprint import pprint
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -65,20 +64,24 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
-from verl.utils.import_utils import load_class_from_fqn
+from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.speculative_decoding import (
+    align_prev_to_gen,
+    build_ctx,
+    rand_reuse_all_cut,
+    rand_reuse_cut,
+    spec_cut,
+    spec_cut_with_knobs,
+)
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
-
-from verl.utils.speculative_decoding import spec_cut, \
-    spec_cut_with_knobs, rand_reuse_cut, rand_reuse_all_cut, \
-    build_ctx, align_prev_to_gen
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -239,6 +242,9 @@ def compute_advantage(
     return data
 
 
+@deprecated(
+    "main_ppo.py is deprecated, and wil be replaced by main_ppo_sync.py in v0.8.0, please use main_ppo_sync.py instead."
+)
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -325,6 +331,7 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+        self._init_dump_executor()
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -408,10 +415,11 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+    @staticmethod
+    def _write_generations(inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
+        """Write generation samples as JSONL (runs in background thread)."""
         os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        filename = os.path.join(dump_path, f"{global_steps}.jsonl")
 
         n = len(inputs)
         base_data = {
@@ -419,34 +427,66 @@ class RayPPOTrainer:
             "output": outputs,
             "gts": gts,
             "score": scores,
-            "step": [self.global_steps] * n,
+            "step": [global_steps] * n,
         }
 
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
 
-        lines = []
-        for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False, default=str))
-
         with open(filename, "w") as f:
-            f.write("\n".join(lines) + "\n")
+            for i in range(n):
+                entry = {k: v[i] for k, v in base_data.items()}
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
 
         print(f"Dumped generations to {filename}")
 
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+        """Dump rollout/validation samples as JSONL asynchronously."""
+        global_steps = self.global_steps
+        future = self._dump_executor.submit(
+            self._write_generations,
+            inputs,
+            outputs,
+            gts,
+            scores,
+            reward_extra_infos_dict,
+            dump_path,
+            global_steps,
+        )
+        self._dump_futures.append(future)
+        # Clean up completed futures and surface any exceptions early
+        still_pending = []
+        for f in self._dump_futures:
+            if f.done():
+                f.result()  # re-raises if the write failed
+            else:
+                still_pending.append(f)
+        self._dump_futures = still_pending
+
+    def _init_dump_executor(self):
+        """Create or recreate the dump executor and futures list."""
+        self._dump_executor = ThreadPoolExecutor(max_workers=1)
+        self._dump_futures = []
+
+    def _shutdown_dump_executor(self):
+        """Drain pending dump futures and shut down the executor."""
+        for f in self._dump_futures:
+            f.result()
+        self._dump_futures.clear()
+        self._dump_executor.shutdown(wait=True)
+
     def _dump_generations_pt(
-            self,
-            inputs: List[str],
-            outputs: List[str],
-            scores: List[float],
-            log_probs: List[List[float]],  # token-level log p
-            reward_extra_infos_dict: Dict[str, Any],
-            dump_path: str,
-            response_masks,
-            responses,
-            position_ids,
+        self,
+        inputs: list[str],
+        outputs: list[str],
+        scores: list[float],
+        log_probs: list[list[float]],  # token-level log p
+        reward_extra_infos_dict: dict[str, Any],
+        dump_path: str,
+        response_masks,
+        responses,
+        position_ids,
     ):
         """Dump rollout/validation samples as .pt (torch.save)."""
         os.makedirs(dump_path, exist_ok=True)
@@ -462,25 +502,24 @@ class RayPPOTrainer:
             "input": [inputs[i] for i in order],
             "output": [outputs[i] for i in order],
             "score": torch.tensor([scores[i] for i in order], dtype=torch.float32),
-            "log_probs": (log_probs.index_select(0, order_idx)
-                          .to(torch.float32)),
+            "log_probs": (log_probs.index_select(0, order_idx).to(torch.float32)),
             "response_masks": (response_masks.index_select(0, order_idx)),
             "responses": (responses.index_select(0, order_idx)),
             "position_ids": (position_ids.index_select(0, order_idx)),
-            "orig_idx": torch.tensor(order, dtype=torch.int32)
+            "orig_idx": torch.tensor(order, dtype=torch.int32),
         }
 
         # 2. other extra fields
         for k, v in reward_extra_infos_dict.items():
             if len(v) == len(inputs):
-                data[k] = torch.tensor([v[i] for i in order]) if isinstance(v[0], (int, float)) \
-                    else [v[i] for i in order]
+                data[k] = (
+                    torch.tensor([v[i] for i in order]) if isinstance(v[0], int | float) else [v[i] for i in order]
+                )
             else:
                 data[k] = v
         # 3. save
         torch.save(data, filename)
         print(f"[dump] {len(inputs)} samples → {filename}")
-
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -499,7 +538,7 @@ class RayPPOTrainer:
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = {
-                k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in reward_extra_infos_dict.items()
+                k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in reward_extra_infos_dict.items()
             }
             if "request_id" in batch.non_tensor_batch:
                 reward_extra_infos_to_dump.setdefault(
@@ -524,7 +563,7 @@ class RayPPOTrainer:
                     inputs=inputs,
                     outputs=outputs,
                     scores=scores,
-                    log_probs=batch.batch['old_log_probs'],
+                    log_probs=batch.batch["old_log_probs"],
                     reward_extra_infos_dict=reward_extra_infos_dict,
                     dump_path=rollout_data_dir,
                     response_masks=batch.batch["response_mask"],
@@ -532,7 +571,6 @@ class RayPPOTrainer:
                     position_ids=batch.batch["position_ids"],
                 )
                 self.latest_old_policy_tensor[sid].append(os.path.join(rollout_data_dir, f"{self.global_steps}.pt"))
-
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1228,8 +1266,10 @@ class RayPPOTrainer:
         self.latest_old_policy = pol_txt
         self.latest_old_policy_tensor = pol_pt
 
-        print(f"[INIT] preload txt={sum(len(v) for v in pol_txt.values())}  "
-              f"pt={sum(len(v) for v in pol_pt.values())}  files")
+        print(
+            f"[INIT] preload txt={sum(len(v) for v in pol_txt.values())}  "
+            f"pt={sum(len(v) for v in pol_pt.values())}  files"
+        )
 
     def _compute_values(self, batch: DataProto) -> DataProto:
         batch_td = batch.to_tensordict()
@@ -1382,6 +1422,9 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        if self._dump_executor._shutdown:
+            self._init_dump_executor()
+
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
@@ -1409,6 +1452,7 @@ class RayPPOTrainer:
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self._shutdown_dump_executor()
                 return
 
         if self.config.actor_rollout_ref.rollout.skip.get("enable", False):
@@ -1493,7 +1537,7 @@ class RayPPOTrainer:
                         # breakpoint()
                         sid = ((self.global_steps - 1) % self.num_buckets) + 1
 
-                        print(f"Begin Speculative Decoding...")
+                        print("Begin Speculative Decoding...")
                         print(f"Current step: {self.global_steps}\t Total buckets: {self.num_buckets}")
                         print(f"Current sid: {sid=}\t latest_old_policy: {self.latest_old_policy_tensor[sid]}")
                         prev_texts = self.latest_old_policy[sid]
@@ -1515,9 +1559,9 @@ class RayPPOTrainer:
                                 # aligned_texts = [prev_data['input'][i] for i in perm.tolist()]
                                 # aligned_outputs = [prev_data['output'][i] for i in perm.tolist()]
                                 aligned_old_logp = aligned["log_probs"]
-                                aligned_old_response_mask = prev_data['response_masks'].index_select(0, perm)
-                                aligned_old_responses = prev_data['responses'].index_select(0, perm)
-                                aligned_position_ids = prev_data['position_ids'].index_select(0, perm)
+                                aligned_old_response_mask = prev_data["response_masks"].index_select(0, perm)
+                                aligned_old_responses = prev_data["responses"].index_select(0, perm)
+                                aligned_position_ids = prev_data["position_ids"].index_select(0, perm)
 
                                 if self.tokenizer.pad_token is None:
                                     self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -1528,15 +1572,17 @@ class RayPPOTrainer:
                                 attention_mask = torch.cat([prompt_attn_mask, aligned_old_response_mask], dim=1)
                                 input_ids = torch.cat([prompt_ids, aligned_old_responses], dim=-1)
 
-                                pre_prob_data = DataProto.from_single_dict({
-                                    "responses": aligned_old_responses,
-                                    "input_ids": input_ids,
-                                    "attention_mask": attention_mask,
-                                    "position_ids": aligned_position_ids
-                                })
+                                pre_prob_data = DataProto.from_single_dict(
+                                    {
+                                        "responses": aligned_old_responses,
+                                        "input_ids": input_ids,
+                                        "attention_mask": attention_mask,
+                                        "position_ids": aligned_position_ids,
+                                    }
+                                )
                                 pre_log_probs = self.actor_rollout_wg.compute_log_prob(pre_prob_data)
                                 old_logp = aligned_old_logp
-                                new_logp = pre_log_probs.batch['old_log_probs']
+                                new_logp = pre_log_probs.batch["old_log_probs"]
                                 response_mask = aligned_old_response_mask
 
                                 spec_bias = self.config.trainer.get("spec_bias", 0.0)
@@ -1587,19 +1633,29 @@ class RayPPOTrainer:
                                 p_msk = gen_batch.batch["attention_mask"][rows]
                                 p_pos = gen_batch.batch["position_ids"][rows]
                                 ctx_ids, ctx_msk, ctx_pos, max_k = build_ctx(
-                                    p_ids, p_msk, p_pos,
+                                    p_ids,
+                                    p_msk,
+                                    p_pos,
                                     aligned_old_responses[rows],
                                     cut_idx[rows],
                                     pad_id=self.tokenizer.pad_token_id,
                                 )
 
-                                need_dp = DataProto.from_single_dict({
-                                    "input_ids": ctx_ids,
-                                    "attention_mask": ctx_msk,
-                                    "position_ids": ctx_pos,
-                                })
+                                need_dp = DataProto.from_single_dict(
+                                    {
+                                        "input_ids": ctx_ids,
+                                        "attention_mask": ctx_msk,
+                                        "position_ids": ctx_pos,
+                                    }
+                                )
                                 need_dp.meta_info = dict(gen_batch.meta_info)
-                                per_req_np = out["per_request_max_new_tokens"][idx_need.cpu()].detach().cpu().numpy().astype(np.int32)
+                                per_req_np = (
+                                    out["per_request_max_new_tokens"][idx_need.cpu()]
+                                    .detach()
+                                    .cpu()
+                                    .numpy()
+                                    .astype(np.int32)
+                                )
 
                                 # need_dp.meta_info["per_request_max_new_tokens"] = per_req
                                 need_dp.non_tensor_batch["per_request_max_new_tokens"] = per_req_np
@@ -1617,7 +1673,7 @@ class RayPPOTrainer:
                                 else:
                                     gen_batch = need_dp
 
-                                metrics.update(out['metrics'])
+                                metrics.update(out["metrics"])
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
@@ -1631,7 +1687,7 @@ class RayPPOTrainer:
                         combined_gen_output.meta_info.pop("timing", None)
 
                     gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
-                    
+
                     # bsliu - 2025-08-12-04:20:52
                     if spec_decoding:
                         if have_pre_rollouts:
@@ -1662,9 +1718,9 @@ class RayPPOTrainer:
 
                                 if idx_reuse.numel() > 0:
                                     final_resp[idx_reuse] = aligned_old_responses[idx_reuse]
-                                    final_attn[idx_reuse, P:P + R] = aligned_old_response_mask[idx_reuse]
+                                    final_attn[idx_reuse, P : P + R] = aligned_old_response_mask[idx_reuse]
                                     last_pos_reuse = prompt_pos_ids[idx_reuse, -1].unsqueeze(1)
-                                    final_pos[idx_reuse, P:P + R] = last_pos_reuse + delta
+                                    final_pos[idx_reuse, P : P + R] = last_pos_reuse + delta
 
                                 # trunc_total = 0
                                 trunc_nonpad = 0
@@ -1681,21 +1737,24 @@ class RayPPOTrainer:
                                             final_resp[i, :keep_pref] = aligned_old_responses[i, :keep_pref]
 
                                         if take_new > 0:
-                                            final_resp[i, keep_pref:keep_pref + take_new] = new_resp[row_in_sub, :take_new]
+                                            final_resp[i, keep_pref : keep_pref + take_new] = new_resp[
+                                                row_in_sub, :take_new
+                                            ]
 
                                         # 3) count the number of non-pad tokens in the truncated "new response"
                                         trunc_len = min(k, R)
                                         if trunc_len > 0:
-                                            tail = new_resp[row_in_sub, R - trunc_len: R]
+                                            tail = new_resp[row_in_sub, R - trunc_len : R]
                                             # trunc_total   += trunc_len
                                             trunc_nonpad_tokens += int((tail != pad_id).sum().item())
                                             if trunc_nonpad_tokens > 0:
                                                 trunc_nonpad += 1
 
-                                    # —— here reconstruct the response segment mask of need rows, **include the first pad/eot**
+                                    # —— here reconstruct the response segment mask of need rows,
+                                    # **include the first pad/eot**
                                     nr = idx_need.long()
                                     need_resp_full = final_resp[nr]  # [N_need, R]
-                                    is_pad = (need_resp_full == pad_id)  # [N_need, R]
+                                    is_pad = need_resp_full == pad_id  # [N_need, R]
                                     has_pad = is_pad.any(dim=1)  # [N_need]
                                     # position of the first pad (0 when no pad)
                                     first_pad_idx = torch.argmax(is_pad.to(torch.int32), dim=1)  # [N_need]
@@ -1703,16 +1762,20 @@ class RayPPOTrainer:
                                     L_inclusive = torch.where(
                                         has_pad,
                                         first_pad_idx + 1,
-                                        torch.full_like(first_pad_idx, fill_value=need_resp_full.size(1))
+                                        torch.full_like(first_pad_idx, fill_value=need_resp_full.size(1)),
                                     )  # [N_need]
-                                    col = torch.arange(need_resp_full.size(1), dtype=prompt_attn_mask.dtype).unsqueeze(0)  # [1,R]
-                                    resp_mask_need = (col < L_inclusive.unsqueeze(1)).to(prompt_attn_mask.dtype)  # [N_need,R]
+                                    col = torch.arange(need_resp_full.size(1), dtype=prompt_attn_mask.dtype).unsqueeze(
+                                        0
+                                    )  # [1,R]
+                                    resp_mask_need = (col < L_inclusive.unsqueeze(1)).to(
+                                        prompt_attn_mask.dtype
+                                    )  # [N_need,R]
 
-                                    final_attn[nr, P:P + R] = resp_mask_need
+                                    final_attn[nr, P : P + R] = resp_mask_need
                                     last_pos_need = prompt_pos_ids[nr, -1].unsqueeze(1)
-                                    final_pos[nr, P:P + R] = last_pos_need + delta
+                                    final_pos[nr, P : P + R] = last_pos_need + delta
 
-                                    final_inputs[:, P:P + R] = final_resp
+                                    final_inputs[:, P : P + R] = final_resp
 
                                 # assemble final DataProto
                                 merged = {
@@ -1970,7 +2033,7 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 time_accumulation += timing_raw["step"]
-                timing_raw['time_accumulation'] = time_accumulation
+                timing_raw["time_accumulation"] = time_accumulation
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
@@ -2000,6 +2063,7 @@ class RayPPOTrainer:
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    self._shutdown_dump_executor()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -2009,3 +2073,6 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+        # Ensure dump executor is shut down when training loop ends without reaching is_last_step
+        self._shutdown_dump_executor()

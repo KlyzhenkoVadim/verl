@@ -82,6 +82,7 @@ verl is fast with:
    algo/rollout_corr_math.md
    algo/otb.md
    algo/dppo.md
+   algo/opd.md
 
 .. toctree::
    :maxdepth: 1
@@ -155,6 +156,7 @@ verl is fast with:
 
    amd_tutorial/amd_build_dockerfile_page.rst
    amd_tutorial/amd_vllm_page.rst
+   amd_tutorial/amd_quick_start.rst
    ascend_tutorial/README.md
    ascend_tutorial/get_start/dockerfile_build_guidance.rst
    ascend_tutorial/get_start/install_guidance.rst

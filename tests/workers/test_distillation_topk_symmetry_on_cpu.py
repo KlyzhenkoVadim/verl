@@ -21,11 +21,20 @@ downstream loss raised KeyError. This test invokes prepare_model_outputs on
 a stub engine for both branches with distillation_use_topk=True and asserts
 the distillation keys produced by logits_processor_func are propagated into
 model_output as nested tensors in both cases.
+
+``logprobs_from_logits`` is patched out: in CI environments where flash-attn
+is installed, it dispatches to a Triton CrossEntropyLoss kernel that cannot
+operate on CPU tensors. The substitute returns a dummy ``log_probs`` tensor
+of the right shape, which is sufficient for this test — the contract under
+test is the propagation of distillation keys, not the numerical correctness
+of log-prob computation.
 """
 
 import os
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -117,13 +126,22 @@ def test_distillation_outputs_emitted_in_both_padding_modes(use_remove_padding):
     )
 
     eng = _make_engine_stub()
-    model_output = FSDPEngineWithLMHead.prepare_model_outputs(
-        eng,
-        output=output,
-        output_args=output_args,
-        micro_batch=micro_batch,
-        logits_processor_func=_make_logits_processor(_DISTILLATION_KEYS),
-    )
+
+    # Patch logprobs_from_logits because flash-attn's Triton CrossEntropyLoss
+    # cannot operate on CPU tensors. The shape is what downstream code asserts
+    # against (v.shape == log_probs.shape), and prepare_model_outputs reduces
+    # both branches to a (total_nnz,) log_probs over the rmpad'ed logits.
+    with patch(
+        "verl.workers.engine.fsdp.transformer_impl.logprobs_from_logits",
+        return_value=torch.zeros(total_nnz),
+    ):
+        model_output = FSDPEngineWithLMHead.prepare_model_outputs(
+            eng,
+            output=output,
+            output_args=output_args,
+            micro_batch=micro_batch,
+            logits_processor_func=_make_logits_processor(_DISTILLATION_KEYS),
+        )
 
     assert "log_probs" in model_output, (
         f"log_probs missing (use_remove_padding={use_remove_padding}); keys: {list(model_output.keys())}"
